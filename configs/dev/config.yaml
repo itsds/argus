@@ -1,0 +1,34 @@
+## Argus — Dev Environment Configuration
+
+llm:
+  provider: google
+  model: gemini-2.0-flash
+  temperature: 0.0
+  max_retries: 2
+
+logging:
+  level: DEBUG
+  format: json
+  correlation_id: true
+
+pipeline:
+  iceberg_catalog: local
+  kafka_bootstrap: localhost:9092
+  schema_registry: http://localhost:8081
+  snowflake: null
+  airflow_api: http://localhost:8080/api/v1
+  spark_history: http://localhost:18080/api/v1
+
+agents:
+  max_iterations: 10
+  timeout_seconds: 120
+
+output:
+  notifications:
+    slack_webhook: null
+    pagerduty_key: null
+    email: null
+  audit_log:
+    enabled: true
+    destination: file
+    path: logs/audit.jsonl

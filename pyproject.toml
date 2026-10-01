@@ -1,0 +1,39 @@
+[project]
+name = "argus"
+version = "0.1.0"
+description = "Argus — four-agent diagnostic platform for the TTAG pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-core>=0.3",
+    "langgraph>=0.2",
+    "langchain-google-genai>=2.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+openai = ["langchain-openai>=0.2"]
+anthropic = ["langchain-anthropic>=0.2"]
+api = ["fastapi>=0.110", "uvicorn>=0.30"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+all = ["argus[openai,anthropic,api,dev]"]
+
+[project.scripts]
+argus = "argus.cli.main:cli"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
