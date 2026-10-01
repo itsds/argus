@@ -1,0 +1,37 @@
+## Argus — Production Environment Configuration
+
+llm:
+  provider: openai
+  model: gpt-4o
+  temperature: 0.0
+  max_retries: 3
+
+logging:
+  level: INFO
+  format: json
+  correlation_id: true
+
+pipeline:
+  iceberg_catalog: hive_metastore
+  kafka_bootstrap: ${KAFKA_BOOTSTRAP_SERVERS}
+  schema_registry: ${SCHEMA_REGISTRY_URL}
+  snowflake:
+    account: ${SNOWFLAKE_ACCOUNT}
+    warehouse: TTAG_WH
+    database: TTAG_GOLD
+  airflow_api: ${AIRFLOW_API_URL}
+  spark_history: ${SPARK_HISTORY_URL}
+
+agents:
+  max_iterations: 15
+  timeout_seconds: 300
+
+output:
+  notifications:
+    slack_webhook: ${SLACK_WEBHOOK_URL}
+    pagerduty_key: ${PAGERDUTY_KEY}
+    email: oncall@company.com
+  audit_log:
+    enabled: true
+    destination: database
+    path: null
