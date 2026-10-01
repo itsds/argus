@@ -21,6 +21,7 @@ implementation; this guide focuses on the *architecture-level why*.
 - [Phase 0: Agent Foundations](#phase-0-agent-foundations)
 - [Phase 1: Platform Skeleton](#phase-1-platform-skeleton)
 - [Phase 2: Reconciliation Diagnostics Agent](#phase-2-reconciliation-diagnostics-agent)
+- [Phase 3: DLQ Triage & Auto-Remediation Agent](#phase-3-dlq-triage--auto-remediation-agent)
 - [Concept Index](#concept-index)
 - [Glossary](#glossary)
 
@@ -501,7 +502,461 @@ Tool Docstring: "Checks for duplicate natural keys in Silver. Duplicates from
 The entry node calls `.invoke({...})` to produce the seed messages that
 start the ReAct conversation.
 
-<!-- PHASE 2 REMAINING FILES WILL BE ADDED HERE -->
+### `argus/agents/reconciliation/graph.py` — LangGraph StateGraph
+
+**Concepts taught:** StateGraph assembly, node factories, conditional edges,
+`ToolNode`, `.bind_tools()`, `.with_structured_output()`, closure pattern
+
+This is where the Reconciliation agent comes alive. The previous files defined
+the pieces — tools, state, prompts — and this file wires them into an executable
+graph.
+
+#### The Four Nodes
+
+| Node | What It Does | LLM Call? |
+|------|-------------|-----------|
+| **entry** | Renders `RECON_PROMPT_TEMPLATE` → seeds `[SystemMessage, HumanMessage]` | No |
+| **llm** | Sends full message history to `model.bind_tools(RECON_TOOLS)` | Yes |
+| **tools** | `ToolNode(RECON_TOOLS)` — auto-executes tool calls from AIMessage | No |
+| **report** | `model.with_structured_output(ReconReport)` — produces diagnosis | Yes |
+
+#### The ReAct Loop as a Graph
+
+```
+entry ──► llm ──► should_continue? ──► tools ──► (back to llm)
+                       │
+                       ▼ (no tools / max iterations)
+                    report ──► END
+```
+
+The conditional edge `_should_continue` is the loop's control flow:
+1. **Safety valve** — if `iteration >= max_iterations`, force `"report"` (prevents
+   runaway loops)
+2. **Tool calls present** — if the AIMessage has `tool_calls`, route to `"tools"`
+3. **No tool calls** — route to `"report"` (investigation complete)
+
+#### Two Model Configurations from One LLM
+
+A critical detail: `bind_tools()` and `with_structured_output()` are different
+invocation modes. You can't use both on the same call:
+
+```python
+llm = create_llm(config)                   # base model
+model_with_tools = llm.bind_tools(RECON_TOOLS)  # for investigation (llm node)
+report_model = llm.with_structured_output(ReconReport)  # for diagnosis (report node)
+```
+
+#### The Closure Pattern
+
+Nodes are functions that take `(state)` — there's no way to pass the LLM as an
+argument. The solution: factory functions that capture the model in a closure:
+
+```python
+def _make_llm_node(model_with_tools):      # factory takes the dependency
+    def llm_node(state: dict) -> dict:     # LangGraph calls this
+        response = model_with_tools.invoke(state["messages"])  # captured
+        return {"messages": [response], "iteration": state["iteration"] + 1}
+    return llm_node
+```
+
+Why not globals? Untestable, can't run two graphs with different models.
+Why not a class? Works, but adds ceremony for functions that just need one
+captured dependency.
+
+#### ToolNode — Zero Boilerplate Tool Execution
+
+LangGraph's prebuilt `ToolNode` reads `tool_calls` from the last AIMessage,
+matches each tool name against the provided list, executes the function, and
+returns `ToolMessage`s. You never write `if tool_name == "..."` dispatch logic.
+
+#### The Report Instruction Trick
+
+The report node appends a final `HumanMessage` telling the LLM to produce its
+diagnosis — but to a *copy* of the messages, not to graph state. The
+investigation history stays clean; only the report model sees the extra instruction.
+
+### `tests/agents/test_recon_agent.py` — Unit Tests
+
+**Concepts taught:** Mocking LLM agents, `unittest.mock.patch`, pytest-asyncio,
+test isolation, testing non-deterministic systems
+
+Testing LLM-powered agents is fundamentally different from testing normal
+functions. The LLM is non-deterministic — even with `temperature=0`, responses
+can vary. You can't write `assert result == exact_string`. Instead, you test
+the **structure** (does data flow correctly?) and **plumbing** (does the adapter
+translate correctly?), not the LLM's reasoning.
+
+#### What Gets Tested
+
+| Test Area | What It Verifies |
+|-----------|-----------------|
+| Agent properties | `name`, `description`, lazy `_graph = None` |
+| `make_initial_state()` | Required fields, defaults, custom max_iterations |
+| `_extract_tool_calls()` | Empty list, no tool calls, single/multiple, non-AI messages |
+| Success path | AgentResult status, report dict conversion, actions_taken audit trail |
+| Failure paths | Graph exception → failure result, None report → failure, missing gate → "unknown" |
+| Lazy init | Graph built once on first invoke, cached across subsequent invokes |
+| Config integration | `max_iterations` flows from config to initial state |
+
+#### The Mock Injection Pattern
+
+```python
+mock_graph = MagicMock()
+mock_graph.invoke.return_value = { ... predictable final state ... }
+agent._graph = mock_graph   # bypass build_graph() entirely
+result = await agent.invoke(context)
+assert result.status == "success"
+```
+
+By setting `agent._graph` directly, we replace the entire LangGraph execution
+with a predictable response. The test verifies that `invoke()` correctly
+translates `TriggerContext` → initial state, extracts the report, converts via
+`.model_dump()`, and packages into `AgentResult`.
+
+#### `patch.object` for Lazy Init Testing
+
+```python
+with patch.object(agent, "build_graph", return_value=mock_graph) as mock_build:
+    await agent.invoke(context)
+    await agent.invoke(context)
+    mock_build.assert_called_once()   # NOT twice — cached after first call
+```
+
+Here we can't inject `_graph` directly because we're testing that `invoke()`
+calls `build_graph()` exactly once. `patch.object` replaces the method
+temporarily and tracks call count.
+
+#### Why Helper Functions Instead of `@pytest.fixture`?
+
+Fixtures are great for setup identical across all tests. But these tests need
+*slightly different* configs and contexts. Helper functions with parameters are
+more flexible — each test calls `_make_config({...})` with its own overrides.
+
+### `experiments/recon_live_test.py` — Live Integration Test
+
+**Concepts taught:** Integration testing vs unit testing, end-to-end agent
+validation, observable debugging, CLI argument parsing
+
+This is the counterpart to unit tests — it runs the full agent with a real LLM
+(Gemini free tier) to verify that the LLM actually understands the prompts,
+calls the right tools, and produces valid structured output.
+
+#### Unit Test vs Live Test
+
+| Dimension | Unit Test | Live Test |
+|-----------|-----------|-----------|
+| LLM | Mocked | Real (Gemini) |
+| Speed | < 1 second | 10-30 seconds |
+| Determinism | Yes | No |
+| When to run | Every commit | Manual / staging |
+| What it catches | Structural regressions | Prompt engineering issues |
+
+Both are necessary. Unit tests catch plumbing breakage instantly. Live tests
+catch reasoning failures that only surface with a real LLM.
+
+#### The Two Scenarios
+
+- **Gate 3 (2026-09-28):** Bronze→Silver row count mismatch from 111 duplicate
+  booking_ids. Expected tools: `query_gate_results` → `compare_row_counts` →
+  `check_duplicate_keys`.
+
+- **Gate 4 (2026-09-27):** Gold→Snowflake count mismatch from 15 NULL card_sk
+  rows. Expected tools: `query_gate_results` → `compare_row_counts` →
+  `check_fk_integrity`.
+
+Each exercises a different investigation path, validating the system prompt's
+investigation strategy actually guides the LLM correctly.
+
+---
+
+## Phase 3: DLQ Triage & Auto-Remediation Agent
+
+Phase 3 builds the second Argus agent. If Phase 2 taught you how to build a
+ReAct agent from scratch, Phase 3 teaches you how to **reuse that pattern**
+while adding two new prompt engineering techniques: **classification with
+confidence scoring** and **guarded side effects**.
+
+The big insight: the graph topology (ReAct loop) is identical to Phase 2.
+What changes is the *content* — different tools, different prompts, different
+state shape. This validates that the ReAct pattern is genuinely reusable.
+
+### What's New in Phase 3
+
+| Concept | Where It Appears | Why It Matters |
+|---------|-----------------|----------------|
+| Classification prompting | `prompts.py` | The LLM must categorize, not just investigate |
+| Confidence calibration | `prompts.py` | Without it, LLMs default to 0.9 or 0.5 for everything |
+| Guarded side effects | `dlq_tools.py` | First agent that CHANGES pipeline state |
+| Idempotency guards | `dlq_tools.py` | Prevents double-requeue on retry |
+| Safety limits | `dlq_tools.py` | Caps side effects per invocation |
+| Incremental accumulators | `state.py` | State tracks classifications and requeue audit |
+| Dual DLQ lanes | `dlq_tools.py`, `prompts.py` | Agent handles two different failure surfaces |
+
+### Read Order
+
+Read these files in this order — each builds on concepts from the previous:
+
+1. `tools/pipeline/dlq_tools.py` — the tools the agent uses
+2. `agents/dlq_triage/state.py` — the state it maintains
+3. `agents/dlq_triage/prompts.py` — the instructions it follows
+4. `agents/dlq_triage/graph.py` — the wiring that connects everything
+5. `agents/dlq_triage/agent.py` — the adapter to the platform
+6. `tests/agents/test_dlq_agent.py` — how to test it
+7. `experiments/dlq_live_test.py` — how to run it for real
+
+### `argus/tools/pipeline/dlq_tools.py` — DLQ Investigation Tools
+
+**Concepts taught:** Side-effect tools, idempotency guards, safety limits,
+dual data sources, audit trails
+
+This file introduces the biggest difference from Phase 2: a tool that
+**changes state** instead of just reading it. The Recon agent's tools were
+all read-only (query this, compare that). The DLQ agent's `requeue_message`
+tool puts messages back into the pipeline.
+
+#### Side Effects Need Safety Layers
+
+Side-effect tools need defensive programming that read-only tools don't:
+
+```
+Layer 1: PROMPT ENGINEERING — system prompt says "NEVER requeue SCHEMA_MISMATCH"
+Layer 2: IDEMPOTENCY GUARD — _REQUEUED_RECORDS set prevents double-requeue
+Layer 3: SAFETY LIMIT — _MAX_REQUEUE_PER_INVOCATION = 10 caps total requeues
+Layer 4: AUDIT TRAIL — every requeue returns a logged confirmation string
+```
+
+Each layer catches failures the layer above might miss. The prompt might not
+prevent the LLM from trying; the idempotency guard catches retries; the
+safety limit prevents runaway requeuing; the audit trail makes everything
+visible.
+
+#### Dual DLQ Lanes
+
+The TTAG pipeline has two DLQ mechanisms:
+
+- **Kafka DLQ** (Benefit lane) — consumer processing failures land in a DLQ
+  topic. Error info is in Kafka headers.
+- **bad_files Iceberg quarantine** (Booking lane) — file ingestion failures
+  move files to a quarantine table. Error info is in the record metadata.
+
+The `read_dlq_records` tool reads from either lane based on the `source_lane`
+parameter. This teaches an important design pattern: different infrastructure
+surfaces can present the same abstraction to the agent.
+
+#### Tool Design for Classification
+
+The `read_dlq_records` tool returns rich error metadata (error_class,
+error_message, payload_summary) specifically so the LLM can classify records.
+The `query_schema_changelog` tool exists purely as a cross-reference source
+for SCHEMA_MISMATCH classification — without it, the LLM would classify
+based on error messages alone, which is less reliable.
+
+### `argus/agents/dlq_triage/state.py` — DLQ State Schema
+
+**Concepts taught:** Incremental accumulators, side-effect tracking in state,
+task-specific state vs generic mechanism
+
+#### Two New Accumulator Fields
+
+DLQTriageState has everything ReconState had, plus two new fields that
+illustrate how different tasks need different state shapes:
+
+```python
+# Builds up as the agent classifies each record
+classifications: Annotated[list[DLQRecord], operator.add]
+
+# Tracks every requeue action for the final report
+requeue_audit: Annotated[list[str], operator.add]
+```
+
+The `classifications` accumulator exists because the DLQ agent's work is
+*incremental* — it classifies records one at a time across multiple ReAct
+iterations. The Recon agent's work was *holistic* — it investigated globally
+and produced one report at the end.
+
+The `requeue_audit` accumulator exists because the DLQ agent has *side
+effects* that need tracking. The Recon agent was read-only, so it didn't
+need to track what it changed.
+
+#### The Same Mechanism, Different Shape
+
+Both ReconState and DLQTriageState use `Annotated[list, operator.add]` for
+accumulation and plain fields for scalars. The LangGraph mechanism is
+generic; the state shape encodes your agent's specific workflow.
+
+### `argus/agents/dlq_triage/prompts.py` — Classification Rubric
+
+**Concepts taught:** Classification prompting, confidence calibration,
+few-shot examples in system prompts, side-effect guardrails
+
+This is the most instructive file in Phase 3. The Recon agent's prompt said
+"investigate and report." The DLQ agent's prompt says "classify each record
+with a confidence score AND take action based on that classification." This
+requires three new prompt engineering techniques.
+
+#### 1. Classification Rubric
+
+A structured rubric maps evidence patterns to categories:
+
+```
+TRANSIENT → TimeoutException, ConnectionReset, BrokerNotAvailable
+SCHEMA_MISMATCH → SchemaRegistryException + changelog confirms
+DATA_QUALITY → NullPointerException on required fields
+UNKNOWN → anything else, or confidence < 0.60
+```
+
+Without a rubric, the LLM improvises categories or uses inconsistent criteria
+across records. With it, every classification has a clear evidence chain.
+
+#### 2. Confidence Calibration
+
+LLMs have no innate sense of confidence scales. Left uncalibrated, they
+either report 0.90+ for everything (over-confident) or cluster around 0.60
+(under-confident). The prompt fixes this with explicit calibration:
+
+```
+0.85-0.95: clear infrastructure error, no data/schema involvement
+0.70-0.85: likely transient but with some ambiguity
+Below 0.70: don't classify as transient
+```
+
+These ranges anchor the LLM's confidence output to specific evidence levels.
+Combined with the "only requeue if confidence ≥ 0.80" rule, this creates
+a reliable decision boundary for side effects.
+
+#### 3. Few-Shot Examples in the Rubric
+
+```
+Example: TimeoutException from broker → TRANSIENT at 0.90
+Example: SchemaRegistryException + changelog shows pending_consumer_update
+         → SCHEMA_MISMATCH at 0.95
+```
+
+These examples serve double duty: they teach the classification *and* anchor
+the confidence scale. The LLM sees "TimeoutException = 0.90" and calibrates
+similar errors accordingly.
+
+#### Side-Effect Guardrails
+
+The prompt has explicit ✅/❌ rules for requeue safety:
+
+```
+✅ ONLY requeue records classified as TRANSIENT with confidence ≥ 0.80
+❌ NEVER requeue SCHEMA_MISMATCH — they'll fail again the same way
+❌ NEVER requeue DATA_QUALITY — bad data stays bad
+❌ NEVER requeue UNKNOWN — don't retry what you don't understand
+```
+
+These rules are the first line of defense for side effects. The tool has its
+own safety layers (idempotency, rate limit), but preventing the LLM from
+*trying* is cheaper than catching bad attempts.
+
+### `argus/agents/dlq_triage/graph.py` — LangGraph StateGraph
+
+**Concepts taught:** Pattern reuse, topology vs content, swappable components
+
+The most important thing about this file is how *similar* it is to the Recon
+graph. Same topology:
+
+```
+entry ──► llm ──► should_continue? ──► tools ──► (back to llm)
+                       │
+                       ▼
+                    report ──► END
+```
+
+Same node types, same conditional routing, same closure pattern. Only four
+things change:
+
+1. **DLQ_TOOLS** instead of RECON_TOOLS
+2. **DLQTriageState** instead of ReconState
+3. **DLQ_PROMPT_TEMPLATE** instead of RECON_PROMPT_TEMPLATE
+4. **DLQTriageReport** instead of ReconReport
+
+This validates the ReAct topology as a reusable pattern. In Phase 6, we may
+extract a generic `build_react_graph()` that takes tools, state class, prompt
+template, and report model as parameters. Two concrete implementations teach
+the pattern intuitively before abstracting.
+
+#### The Report Node's Different Instruction
+
+The one meaningful difference is the report node's instruction message. The
+Recon report asks for root cause analysis. The DLQ report asks for per-record
+classification summaries, requeue counts, and severity based on the
+classification mix. The instruction shapes what the LLM produces, even with
+the same `.with_structured_output()` mechanism.
+
+### `argus/agents/dlq_triage/agent.py` — DLQ Agent Adapter
+
+**Concepts taught:** Adapter pattern consistency, source_lane vs gate_name,
+config path namespacing
+
+Same five-step pattern as ReconciliationAgent:
+
+1. Lazy graph build (compile once, cache)
+2. Translate TriggerContext → DLQTriageState initial state
+3. `graph.invoke(initial_state)` → final state
+4. Extract DLQTriageReport from final state
+5. Package into AgentResult
+
+The differences are in step 2 (source_lane instead of gate_name, different
+config path for max_iterations) and step 4 (different report fields for
+logging). If the agents' `invoke()` methods were any more similar, you'd
+extract a shared implementation. Right now the duplication is small enough
+that the clarity of seeing the full flow in each agent outweighs the DRY
+benefit.
+
+### `tests/agents/test_dlq_agent.py` — DLQ Unit Tests
+
+**Concepts taught:** Test pattern reuse, testing side-effect agents,
+DLQ-specific fixtures
+
+Same 7 test classes as the Recon tests, adapted for DLQ:
+
+| Test Class | What It Verifies |
+|-----------|-----------------|
+| TestAgentProperties | name="dlq_triage", description mentions classification, lazy init |
+| TestMakeInitialState | source_lane, classifications=[], requeue_audit=[], defaults |
+| TestExtractToolCalls | Same logic — only depends on AIMessage format |
+| TestAgentInvokeSuccess | DLQTriageReport with per-record classifications, requeue counts |
+| TestAgentInvokeFailure | Graph exception, None report, missing source_lane defaults to "both" |
+| TestLazyGraphBuilding | Same pattern — build once, cache |
+| TestConfigIntegration | agents.dlq_triage.max_iterations, fallback to agents.max_iterations |
+
+The test structure being nearly identical validates the BaseAgent contract.
+When two agents follow the same interface, their tests follow the same
+pattern — a sign the abstraction is working.
+
+### `experiments/dlq_live_test.py` — DLQ Live Integration Test
+
+**Concepts taught:** Live testing classification accuracy, requeue safety
+validation, side-effect observability
+
+Same structure as `recon_live_test.py` with two additions:
+
+#### Two DLQ Scenarios
+
+- **Kafka DLQ (2026-09-30):** 6 Benefit lane records spanning all 4
+  classification categories. Tests classification accuracy and requeue
+  safety for transient records.
+
+- **Bad Files (2026-09-29):** 3 Booking lane records spanning 3 categories.
+  Tests the agent handles Iceberg quarantine records differently from Kafka
+  DLQ records.
+
+#### Requeue Safety Validation
+
+The live test includes a post-hoc `_validate_requeue_safety()` function
+that checks every requeued record:
+
+- Was it classified as TRANSIENT? (If not → safety violation)
+- Was its confidence ≥ 0.80? (If not → low-confidence requeue warning)
+
+This validates the prompt engineering end-to-end: the classification rubric
+should prevent the LLM from even *trying* to requeue non-transient records,
+and the confidence calibration should produce scores above 0.80 for genuinely
+transient errors. A safety violation means the rubric or calibration guidance
+needs tightening.
 
 ---
 
@@ -529,7 +984,32 @@ A quick lookup: which file teaches which concept.
 | `.bind_tools()` | `agents/reconciliation/graph.py` | 2 |
 | Conditional edges | `agents/reconciliation/graph.py` | 2 |
 | `with_structured_output()` | `agents/reconciliation/graph.py` | 2 |
+| `ToolNode` (prebuilt) | `agents/reconciliation/graph.py` | 2 |
+| Closure pattern (DI for nodes) | `agents/reconciliation/graph.py` | 2 |
+| Graph compilation | `agents/reconciliation/graph.py` | 2 |
+| Iteration safety valve | `agents/reconciliation/state.py`, `graph.py` | 2 |
+| Adapter pattern (BaseAgent) | `agents/reconciliation/agent.py` | 2 |
+| Lazy initialization | `agents/reconciliation/agent.py` | 2 |
+| Error boundary pattern | `agents/reconciliation/agent.py` | 2 |
+| `.model_dump()` at boundaries | `agents/reconciliation/agent.py` | 2 |
+| Mocking LLM agents | `tests/agents/test_recon_agent.py` | 2 |
+| `unittest.mock.patch` / `patch.object` | `tests/agents/test_recon_agent.py` | 2 |
+| pytest-asyncio | `tests/agents/test_recon_agent.py` | 2 |
+| Test isolation (helpers vs fixtures) | `tests/agents/test_recon_agent.py` | 2 |
+| Integration testing (live LLM) | `experiments/recon_live_test.py` | 2 |
+| `argparse` CLI | `experiments/recon_live_test.py` | 2 |
+| `asyncio.run()` entry point | `experiments/recon_live_test.py` | 2 |
 
+| Classification prompting | `agents/dlq_triage/prompts.py` | 3 |
+| Confidence calibration | `agents/dlq_triage/prompts.py` | 3 |
+| Few-shot examples in system prompt | `agents/dlq_triage/prompts.py` | 3 |
+| Side-effect guardrails | `agents/dlq_triage/prompts.py`, `tools/pipeline/dlq_tools.py` | 3 |
+| Idempotency guard | `tools/pipeline/dlq_tools.py` | 3 |
+| Safety limit (rate limiting side effects) | `tools/pipeline/dlq_tools.py` | 3 |
+| Incremental state accumulators | `agents/dlq_triage/state.py` | 3 |
+| Dual data sources (Kafka DLQ + bad_files) | `tools/pipeline/dlq_tools.py` | 3 |
+| ReAct topology reuse | `agents/dlq_triage/graph.py` | 3 |
+| Requeue safety validation | `experiments/dlq_live_test.py` | 3 |
 <!-- More rows will be added as new files are written -->
 
 ---
@@ -603,5 +1083,72 @@ the dimension row is missing.
 changes (e.g., a card's credit limit), the old row is marked inactive and a
 new row is inserted with a new surrogate key. This preserves history — you
 can see what the card's limit was when the transaction happened.
+
+**ToolNode** — LangGraph's prebuilt graph node that automatically executes
+tool calls from an AIMessage. It reads the `tool_calls` field, finds each
+tool by name in the provided list, calls the function, and returns the
+results as `ToolMessage`s. Eliminates manual tool dispatch boilerplate.
+
+**Graph Compilation** — The `graph.compile()` step that freezes a StateGraph's
+topology and returns a `CompiledStateGraph` runnable. Compilation validates
+the structure (no orphan nodes, no missing edges, entry point is set) and
+produces an object you `.invoke()` with initial state.
+
+**Closure** — A function that captures variables from its enclosing scope.
+In Argus, factory functions like `_make_llm_node(model)` return inner functions
+that have access to `model` without it being a global or passed as an argument.
+This is how LangGraph nodes get access to the LLM instance.
+
+**MagicMock** — A mock object from Python's `unittest.mock` that automatically
+creates attributes and methods on access. If you call `mock.invoke(state)`,
+it doesn't crash — it records the call and returns another `MagicMock`. You
+control what it returns via `mock.invoke.return_value = {...}`.
+
+**`patch` / `patch.object`** — Context managers from `unittest.mock` that
+temporarily replace a real object with a mock during a test. `patch.object(agent,
+"build_graph")` replaces `agent.build_graph` with a mock, tracks calls, and
+restores the original when the `with` block exits.
+
+**pytest-asyncio** — A pytest plugin that lets you write `async def test_*()`
+tests. Works with `@pytest.mark.asyncio` decorator or `asyncio_mode = "auto"`
+in `pyproject.toml`. Without it, pytest doesn't know how to `await` async
+test functions.
+
+**Integration Test** — A test that exercises the full system with real
+external dependencies (in Argus, a real LLM). Slower and non-deterministic,
+but catches failures that unit tests can't: bad prompts, incorrect tool
+schemas, structured output mismatches. Complements unit tests rather than
+replacing them.
+
+**Dead Letter Queue (DLQ)** — A holding area for messages or records that
+failed processing. Instead of losing the data, the pipeline moves failures
+to a DLQ for later investigation. In TTAG, the Benefit lane uses a Kafka
+DLQ topic; the Booking lane uses an Iceberg quarantine table (`bad_files`).
+
+**Classification Prompting** — A prompt engineering technique where the
+system prompt provides a structured rubric mapping evidence patterns to
+categories. Unlike open-ended investigation, classification constrains the
+LLM's output to a fixed set of categories with clear criteria.
+
+**Confidence Calibration** — Explicit guidance in the system prompt about
+what confidence scores mean for specific evidence levels. Without calibration,
+LLMs produce arbitrary confidence values. With it, "TimeoutException = 0.90"
+anchors the scale so similar errors get similar scores.
+
+**Idempotency Guard** — A mechanism that prevents the same operation from
+being performed twice. In the DLQ agent, `_REQUEUED_RECORDS` is a set that
+tracks which records have been requeued. If the LLM calls `requeue_message`
+for the same record_id again (common in ReAct loops), the tool returns
+"already requeued" instead of double-processing.
+
+**Guarded Side Effect** — A tool call that changes external state (unlike
+read-only queries) with safety mechanisms: prompt-level rules (don't call it
+for the wrong category), idempotency guards (don't do it twice), rate limits
+(don't do it too much), and audit trails (track what was done).
+
+**Schema Changelog** — A record of schema evolution events in the pipeline.
+The DLQ agent cross-references this to confirm SCHEMA_MISMATCH classifications
+— a "pending_consumer_update" status in the changelog is strong evidence that
+DLQ records with SchemaRegistryException are schema mismatches, not transient.
 
 <!-- More terms will be added as new concepts are introduced -->
