@@ -30,17 +30,24 @@ D:\repos\argus/
 │   │   │   ├── prompts.py     # System/human prompt templates
 │   │   │   ├── graph.py       # LangGraph StateGraph (ReAct loop wiring)
 │   │   │   └── agent.py       # BaseAgent subclass (platform adapter)
-│   │   └── dlq_triage/
-│   │       ├── state.py       # LangGraph state schema (DLQTriageState)
-│   │       ├── prompts.py     # Classification rubric + requeue safety rules
-│   │       ├── graph.py       # LangGraph StateGraph (same ReAct topology)
-│   │       └── agent.py       # BaseAgent subclass (DLQ adapter)
+│   │   ├── dlq_triage/
+│   │   │   ├── state.py       # LangGraph state schema (DLQTriageState)
+│   │   │   ├── prompts.py     # Classification rubric + requeue safety rules
+│   │   │   ├── graph.py       # LangGraph StateGraph (same ReAct topology)
+│   │   │   └── agent.py       # BaseAgent subclass (DLQ adapter)
+│   │   └── backfill/
+│   │       ├── __init__.py    # Package marker (exists)
+│   │       ├── state.py       # BackfillState with HITL approval fields
+│   │       ├── prompts.py     # Multi-phase prompts (investigation, planning, execution)
+│   │       ├── graph.py       # Plan-then-Execute + HITL topology (TODO)
+│   │       └── agent.py       # BaseAgent subclass, two-phase invoke (TODO)
 │   ├── schemas/
 │   │   └── reports.py         # Pydantic report models (all agents)
 │   ├── tools/
 │   │   └── pipeline/
-│   │       ├── recon_tools.py # 6 @tool functions for Recon agent
-│   │       └── dlq_tools.py   # 3 @tool functions for DLQ agent (includes side effects)
+│   │       ├── recon_tools.py    # 6 @tool functions for Recon agent
+│   │       ├── dlq_tools.py     # 3 @tool functions for DLQ agent (includes side effects)
+│   │       └── backfill_tools.py # 8 @tool functions for Backfill agent (2 registries)
 │   └── cli/
 │       └── main.py            # Click CLI entry point
 ├── docs/
@@ -50,7 +57,8 @@ D:\repos\argus/
 │       ├── core-layer/
 │       ├── agent-and-schema-layer/
 │       ├── phase2-reconciliation/
-│       └── phase3-dlq-triage/
+│       ├── phase3-dlq-triage/
+│       └── phase4-backfill/
 ├── tests/
 │   └── agents/
 │       ├── test_recon_agent.py  # Recon unit tests (mocked LLM, 7 test classes)
@@ -108,7 +116,14 @@ D:\repos\argus/
   - ✅ `agents/dlq_triage/agent.py` — Agent class (BaseAgent subclass, source_lane translation)
   - ✅ `tests/agents/test_dlq_agent.py` — Unit tests (7 test classes, mocked LLM)
   - ✅ `experiments/dlq_live_test.py` — Live integration test with real LLM (2 scenarios + requeue safety validation)
-- **Phase 4**: Backfill Planning agent (human-in-the-loop)
+- **Phase 4** (IN PROGRESS): Incident & Backfill Planning agent (human-in-the-loop)
+  - ✅ `tools/pipeline/backfill_tools.py` — 8 tools in 2 registries (5 investigation + 3 execution) with simulated data
+  - ✅ `agents/backfill/state.py` — BackfillState with plan, approval_status, revision_feedback, two-level iteration control
+  - ✅ `agents/backfill/prompts.py` — 3 system prompts (investigation, planning rubric, execution safety) + revision template
+  - ✅ `agents/backfill/graph.py` — Plan-then-Execute + HITL interrupt/resume + rejection loop (8 nodes, 2 ToolNodes, 3 LLM configs, MemorySaver checkpointer)
+  - ✅ `agents/backfill/agent.py` — BaseAgent subclass with two-phase invoke (invoke → needs_approval → resume, thread_id management, interrupt detection via graph_state.next, Command(resume=...))
+  - ⬜ `tests/agents/test_backfill_agent.py` — Unit tests including interrupt/resume/rejection flows
+  - ⬜ `experiments/backfill_live_test.py` — Live integration test with real LLM
 - **Phase 5**: Spark Debugger agent (most complex)
 - **Phase 6**: Integration, testing, observability
 
@@ -119,6 +134,24 @@ D:\repos\argus/
 - **ReAct + Reflection** — Spark Debugger (hypothesis → evidence → refine)
 - **Classification + Confidence Scoring** — DLQ Triage
 - **Human-in-the-Loop** — LangGraph interrupt() for Backfill approval gates
+
+## Phase 4 New Concepts (vs Phase 3)
+
+- **Two-registry tool separation** — `BACKFILL_INVESTIGATION_TOOLS` vs `BACKFILL_EXECUTION_TOOLS`, preventing LLM from accessing execution tools during investigation
+- **Plan-then-Execute pattern** — agent investigates first, produces a BackfillPlan, pauses for human approval, then executes
+- **Human-in-the-Loop (HITL)** — LangGraph `interrupt()` to pause graph for human approval, `Command(resume=...)` to continue
+- **Rejection loop** — human can reject a plan with feedback, agent reworks and re-presents (not just approve/reject binary)
+- **LangGraph checkpointing** — `MemorySaver` (dev) / `SqliteSaver` (prod) to persist state across interrupt/resume
+- **Pipeline locking** — exclusive locks with ownership tracking, timeout-based auto-release, idempotent acquire
+- **Lock → Execute → Release pattern** — enforced ordering for execution tools, lock check before every step
+- **Per-step execution audit** — every `execute_backfill_step` call logged with timestamp and details
+- **Step limit safety** — `_MAX_STEPS_PER_INVOCATION = 20` hard cap prevents runaway execution
+- **Two-level iteration control** — inner loop (ReAct tool calls: `iteration`/`max_iterations`) + outer loop (plan revisions: `plan_iterations`/`max_plan_iterations`)
+- **Plan as intermediate output** — `plan: BackfillPlan | None` is produced mid-graph (not at the end), sent to human for approval
+- **Approval flow state** — `approval_status` (pending/approved/rejected) + `revision_feedback` drive the HITL conditional routing
+- **Multi-phase prompting** — separate system prompts per graph phase (investigation, planning, execution) instead of one monolithic prompt
+- **Structured output rubric** — planning prompt defines good vs bad examples for each BackfillPlan field (like DLQ's confidence calibration but for plan quality)
+- **Revision prompt with feedback injection** — rejected plans get human feedback injected as a HumanMessage with iteration count for urgency
 
 ## Phase 3 New Concepts (vs Phase 2)
 

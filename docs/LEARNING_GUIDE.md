@@ -22,6 +22,7 @@ implementation; this guide focuses on the *architecture-level why*.
 - [Phase 1: Platform Skeleton](#phase-1-platform-skeleton)
 - [Phase 2: Reconciliation Diagnostics Agent](#phase-2-reconciliation-diagnostics-agent)
 - [Phase 3: DLQ Triage & Auto-Remediation Agent](#phase-3-dlq-triage--auto-remediation-agent)
+- [Phase 4: Incident & Backfill Planning Agent](#phase-4-incident--backfill-planning-agent)
 - [Concept Index](#concept-index)
 - [Glossary](#glossary)
 
@@ -960,6 +961,591 @@ needs tightening.
 
 ---
 
+## Phase 4: Incident & Backfill Planning Agent
+
+> **Goal:** Build the third Argus agent, introducing two major new patterns:
+> **Plan-then-Execute** (the agent produces a plan before taking action) and
+> **Human-in-the-Loop** (the graph pauses for human approval before executing
+> the plan). Phase 4 also introduces the **rejection loop** — the human can
+> reject a plan with feedback, and the agent reworks it.
+
+If Phase 2 taught the ReAct loop and Phase 3 taught classification with
+guarded side effects, Phase 4 teaches you how to build an agent that **stops
+and waits for a human** before doing anything dangerous.
+
+### What's New in Phase 4
+
+| Concept | Where It Appears | Why It Matters |
+|---------|-----------------|----------------|
+| Two-registry tool separation | `backfill_tools.py` | Prevents LLM from executing during investigation |
+| Plan-then-Execute pattern | `agents/backfill/graph.py` | Agent plans first, executes only after approval |
+| Human-in-the-Loop (HITL) | `agents/backfill/graph.py` | LangGraph `interrupt()` pauses for human decision |
+| Rejection loop | `agents/backfill/graph.py` | Human rejects → agent reworks → re-presents |
+| LangGraph checkpointing | `agents/backfill/graph.py` | State persists across interrupt/resume |
+| Pipeline locking | `backfill_tools.py` | Exclusive locks prevent concurrent writes |
+| Lock → Execute → Release | `backfill_tools.py` | Enforced ordering for safe backfill execution |
+| Per-step execution audit | `backfill_tools.py` | Every step logged for the final report |
+| Mocking interrupt detection | `test_backfill_agent.py` | Mock `graph.get_state().next` to test paused vs completed |
+| Two-phase test pattern | `test_backfill_agent.py` | Set up mock graph twice (invoke + resume) in a single test |
+| Rejection loop testing | `test_backfill_agent.py` | Full cycle: invoke → reject → reject → approve → success |
+| Guard rail testing | `test_backfill_agent.py` | ValueError when `resume()` called without prior `invoke()` |
+| Live two-phase lifecycle | `backfill_live_test.py` | Real LLM runs invoke → approve → success end-to-end |
+| Plan quality validation | `backfill_live_test.py` | Validate plan structure beyond just status codes |
+| Live rejection feedback | `backfill_live_test.py` | Test whether real LLM incorporates rejection feedback |
+
+### Read Order
+
+Read these files in this order — each builds on concepts from the previous:
+
+```
+argus/tools/pipeline/backfill_tools.py ─── Tool layer (two registries)
+    │
+    │   "What can the agent DO? And when is each tool available?"
+    ▼
+argus/agents/backfill/state.py ─── State schema (plan + approval fields)
+    │
+    │   "What data does the graph carry across the interrupt?"
+    ▼
+argus/agents/backfill/prompts.py ─── System prompt (investigation + planning rubric)
+    │
+    │   "How does the agent reason about incidents and build plans?"
+    ▼
+argus/agents/backfill/graph.py ─── Graph topology (Plan-then-Execute + HITL)
+    │
+    │   "How does the graph pause, resume, and handle rejection?"
+    ▼
+argus/agents/backfill/agent.py ─── Agent class (two-phase invoke)
+    │
+    │   "How does the platform invoke an agent that pauses?"
+    ▼
+tests/agents/test_backfill_agent.py ─── Tests (interrupt/resume/rejection)
+experiments/backfill_live_test.py ─── Live test with real LLM
+```
+
+### `argus/tools/pipeline/backfill_tools.py` — Tool Layer
+
+**Concepts taught:** Two-registry tool separation, pipeline locking,
+Lock → Execute → Release pattern, per-step audit trails
+
+This file introduces the biggest structural difference from Phases 2 and 3:
+**two separate tool registries**. The Recon and DLQ agents had a single tool
+list because their graphs had one phase (investigate → report). The Backfill
+agent has two phases with different risk profiles, and the tool registries
+enforce that boundary.
+
+#### Two Registries, Two Phases
+
+```python
+BACKFILL_INVESTIGATION_TOOLS = [
+    get_incident_context,      # What happened?
+    assess_data_gaps,          # How bad is the damage?
+    check_pipeline_locks,      # Is it safe to plan?
+    get_backfill_history,      # How long will it take?
+    validate_source_readiness  # Is the source data ready?
+]
+
+BACKFILL_EXECUTION_TOOLS = [
+    acquire_pipeline_lock,     # Lock before executing
+    execute_backfill_step,     # Execute one step
+    release_pipeline_lock      # Release and get audit trail
+]
+```
+
+The graph will bind `BACKFILL_INVESTIGATION_TOOLS` during the investigation
+phase and `BACKFILL_EXECUTION_TOOLS` during the execution phase. The LLM
+literally cannot call `execute_backfill_step` during investigation — it's
+not in the bound tool set.
+
+Compare with Phase 3's approach: `DLQ_TOOLS` was a single list with all three
+tools. Safety relied on prompt rules ("only requeue TRANSIENT") plus tool-level
+guards (idempotency, rate limit). Phase 4 adds a **structural** safety layer:
+the tools aren't even available until the human approves the plan.
+
+#### Lock → Execute → Release
+
+The three execution tools enforce a specific ordering:
+
+1. **`acquire_pipeline_lock`** — gets an exclusive lock (idempotent, timeout-based)
+2. **`execute_backfill_step`** — runs one step (refuses without a lock)
+3. **`release_pipeline_lock`** — releases and returns the full audit trail
+
+This pattern prevents two critical failures:
+- **Concurrent writes** — if two backfills run on the same entity simultaneously,
+  they could corrupt data. The exclusive lock prevents this.
+- **Orphaned locks** — if the agent crashes mid-execution, the 60-minute timeout
+  ensures the lock is eventually released.
+
+#### Per-Step Audit Trail
+
+Every `execute_backfill_step` call is logged in `_EXECUTION_AUDIT` with:
+- Timestamp
+- Entity, layer, partition
+- Source snapshot ID
+- Step description
+- Result (simulated success in dev)
+
+When `release_pipeline_lock` is called, it returns the complete audit trail.
+This goes into the agent's final report so humans can verify exactly what was
+executed, in what order, and whether it succeeded.
+
+#### Safety Limits
+
+Like Phase 3's `_MAX_REQUEUE_PER_INVOCATION = 10`, Phase 4 has
+`_MAX_STEPS_PER_INVOCATION = 20`. Even with a valid lock and an approved plan,
+the agent can't execute more than 20 steps in one run. This prevents runaway
+execution if the LLM hallucinates extra steps.
+
+#### Two Simulated Scenarios
+
+- **2026-09-28 (Gate 3 failure):** Silver row count mismatch from duplicate
+  re-delivery → backfill Silver + Gold (multi-layer, ordered)
+- **2026-09-27 (Gate 4 failure):** NULL FKs from failed DIM_CARD refresh →
+  backfill Gold only (single-layer, with dependency gate)
+
+These exercise different backfill strategies: Scenario 1 needs multi-layer
+ordered execution, Scenario 2 needs single-layer execution but has an external
+dependency (DIM_CARD must be refreshed before backfill can proceed).
+
+
+### `argus/agents/backfill/state.py` — State Schema
+
+**Concepts taught:** Plan as intermediate output, HITL approval state fields,
+two-level iteration control, execution audit accumulator
+
+This is the third state schema in Argus. Comparing it with ReconState (Phase 2)
+and DLQTriageState (Phase 3) shows how the HITL pattern requires new state
+fields that autonomous agents don't need.
+
+#### Plan as Intermediate Output
+
+In Recon and DLQ, the report is the LAST thing produced — the graph ends by
+extracting a report from the conversation. The Backfill agent produces a
+`BackfillPlan` as an INTERMEDIATE step. It sits in state between the
+investigation phase and the execution phase, where the human reviews it.
+
+```python
+plan: BackfillPlan | None  # None until planning node produces it
+```
+
+This uses overwrite semantics (no reducer) because we always want the latest
+plan. When the human rejects and the LLM produces a revised plan, the old plan
+is replaced — we don't accumulate a history of rejected plans in state.
+
+#### HITL Approval Fields
+
+Three fields drive the approval gate:
+
+```python
+approval_status: str     # "" → "pending" → "approved" / "rejected"
+revision_feedback: str   # human's rejection reason (empty if not rejected)
+plan_iterations: int     # how many plans have been produced (safety cap)
+max_plan_iterations: int # default 3 — prevents infinite reject-rework loops
+```
+
+`approval_status` is the routing signal. After the interrupt node resumes:
+- `"approved"` → conditional edge routes to execution phase
+- `"rejected"` → conditional edge routes back to investigation with feedback
+
+`revision_feedback` is what makes the rejection loop useful. Without it, the
+LLM would just regenerate the same plan. With feedback injected as a
+HumanMessage, the LLM knows WHAT to change.
+
+#### Two-Level Iteration Control
+
+This is the key insight in BackfillState. The agent has TWO independent loops,
+each needing its own safety cap:
+
+```
+┌──── Outer loop: plan revisions (plan_iterations / max_plan_iterations = 3) ────┐
+│                                                                                 │
+│  ┌──── Inner loop: ReAct tool calls (iteration / max_iterations = 15) ────┐    │
+│  │  LLM calls tools → gets results → calls more tools → ...               │    │
+│  │  Capped at 15 iterations per investigation round                        │    │
+│  └──────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                 │
+│  Planning node → plan produced → interrupt → human reviews                      │
+│  If rejected: iteration resets, plan_iterations increments, loop back            │
+│  If approved: proceed to execution                                              │
+│  If plan_iterations >= 3: stop with error                                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The inner loop resets each time the outer loop cycles — the LLM gets fresh
+investigation iterations for each rework attempt. This prevents a scenario
+where the LLM exhausts its tool-call budget during the first investigation
+and can't call any tools when reworking the rejected plan.
+
+#### Execution Audit
+
+After approval, every execution action is logged:
+
+```python
+execution_audit: Annotated[list[str], operator.add]  # accumulates across tool calls
+```
+
+Same accumulator pattern as DLQ's `requeue_audit`, but tracking the full
+Lock → Execute → Release sequence rather than individual requeue actions.
+
+#### Comparing State Schemas
+
+| Field Category | ReconState | DLQTriageState | BackfillState |
+|---|---|---|---|
+| Messages | ✅ `operator.add` | ✅ same | ✅ same |
+| Trigger context | gate_name | source_lane | trigger_params dict |
+| Loop control | iteration/max | iteration/max | iteration/max + plan_iterations/max |
+| Intermediate output | — | classifications | plan (BackfillPlan) |
+| Side-effect tracking | — | requeue_audit | execution_audit |
+| Final output | report: ReconReport | report: DLQTriageReport | plan IS the output |
+| HITL fields | — | — | approval_status, revision_feedback |
+| Errors | ✅ `operator.add` | ✅ same | ✅ same |
+
+
+### `argus/agents/backfill/prompts.py` — System Prompts
+
+**Concepts taught:** Multi-phase prompting, structured output rubric,
+revision prompt with feedback injection
+
+This is the most complex prompt file in Argus. While the Recon and DLQ agents
+each had ONE system prompt, the Backfill agent has THREE — one per graph phase.
+Plus a revision template for the rejection loop.
+
+#### Why Multiple System Prompts?
+
+The Backfill agent's graph has three distinct phases, each requiring different
+LLM behavior:
+
+```
+Phase 1: INVESTIGATION → "Use these 5 tools to understand the incident"
+         System prompt: BACKFILL_INVESTIGATION_PROMPT
+         Tools bound: BACKFILL_INVESTIGATION_TOOLS
+
+Phase 2: PLANNING → "Produce a BackfillPlan with these exact fields"
+         System prompt: BACKFILL_PLANNING_PROMPT
+         Output: BackfillPlan (via .with_structured_output())
+
+Phase 3: EXECUTION → "Follow Lock → Execute → Release strictly"
+         System prompt: BACKFILL_EXECUTION_PROMPT
+         Tools bound: BACKFILL_EXECUTION_TOOLS
+```
+
+Each prompt is focused on its phase. Putting all three in a single prompt would
+mean the LLM sees execution instructions during investigation (risky — it might
+try to execute early) and wastes tokens on irrelevant context.
+
+#### Investigation Prompt — Tool Strategy
+
+The investigation prompt follows the same pattern as Phase 2's Recon prompt:
+role definition → pipeline architecture → investigation strategy → rules.
+The strategy tells the LLM which tools to call and in what order:
+
+1. `get_incident_context` → understand WHAT happened
+2. `assess_data_gaps` → quantify the DAMAGE
+3. `check_pipeline_locks` → confirm it's SAFE to plan
+4. `get_backfill_history` → estimate DURATION
+5. `validate_source_readiness` → verify SOURCE exists
+
+The key rule: "call at least 3 tools before concluding." This prevents the
+LLM from producing a plan after only calling `get_incident_context`.
+
+#### Planning Prompt — Structured Output Rubric
+
+This is the Phase 4 equivalent of the DLQ prompt's classification rubric.
+Instead of calibrating confidence scores, it calibrates PLAN QUALITY:
+
+For each BackfillPlan field, the rubric shows:
+- **Good example**: "Gate 3 failed on 2026-09-28: Silver booking_detail is
+  111 rows short due to upstream re-delivery"
+- **Bad example**: "There was a pipeline failure" (too vague)
+
+Critical rules for plan quality:
+- Steps must be ORDERED (upstream before downstream — Silver before Gold)
+- Snapshot IDs must come from `validate_source_readiness` results (not hallucinated)
+- Duration estimates must use `get_backfill_history` data as baseline
+- Risk assessment must cite evidence, not generalize
+
+These rules are the planning equivalent of the DLQ prompt's "NEVER requeue
+SCHEMA_MISMATCH" — they prevent common LLM failure modes when producing plans.
+
+#### Execution Prompt — Lock → Execute → Release Safety
+
+The execution prompt is short and strict — it's all rules, no reasoning
+guidance. The LLM's job during execution is mechanical: follow the approved
+plan, execute steps in order, handle failures safely. The three rules:
+
+1. **LOCK FIRST** — acquire before any step, stop if blocked
+2. **EXECUTE IN ORDER** — stop on failure, don't skip ahead
+3. **RELEASE LAST** — always release, even on failure
+
+#### Revision Prompt — Feedback Injection
+
+When the human rejects a plan, this template injects their feedback:
+
+```
+Your backfill plan was REJECTED by the human reviewer.
+This is attempt {plan_iterations} of {max_plan_iterations}.
+
+Reviewer feedback:
+{revision_feedback}
+
+Revise your plan to address the feedback above...
+```
+
+Three design choices in this template:
+1. **"REJECTED" framing** — sets the right context (not ambiguous)
+2. **Iteration count** — "attempt 2 of 3" creates urgency (don't waste it)
+3. **"Focus on what changed"** — prevents the LLM from starting over from
+   scratch and re-calling all investigation tools (wasting iterations)
+
+#### Comparing Prompt Structures
+
+| Aspect | Recon | DLQ | Backfill |
+|---|---|---|---|
+| System prompts | 1 | 1 | 3 (investigation, planning, execution) |
+| Human templates | 1 | 1 | 2 (initial + revision) |
+| ChatPromptTemplates | 1 | 1 | 2 (initial + revision) |
+| Rubric type | investigation strategy | classification + confidence | structured output quality |
+| Side-effect rules | — | requeue safety | Lock → Execute → Release |
+| Feedback handling | — | — | revision prompt with iteration count |
+
+
+### `argus/agents/backfill/graph.py` — The Multi-Phase HITL Graph
+
+**Concepts taught:** `interrupt()` / `Command(resume=...)`, LangGraph checkpointing
+(`MemorySaver`), `thread_id`, multiple `ToolNode`s, multiple LLM configurations,
+multi-phase graph topology, approval gate with rejection loop
+
+This is the most complex graph in Argus — 8 nodes, 2 ToolNodes, 3 LLM
+configurations, and the first use of `interrupt()` for human-in-the-loop. If the
+Recon graph (Phase 2) taught you the ReAct loop and the DLQ graph (Phase 3)
+proved it's reusable, the Backfill graph teaches you how to COMPOSE multiple
+patterns into a single graph.
+
+#### From 4 Nodes to 8: Why the Jump?
+
+The Recon and DLQ graphs each had 4 nodes in one ReAct loop:
+
+```
+entry → llm ↔ tools → report → END
+```
+
+The Backfill graph needs 8 nodes because it has a fundamentally different
+structure — two ReAct loops with an approval gate between them:
+
+```
+entry → investigate_llm ↔ investigation_tools → plan_node
+        → approval_gate ↔ revise_node → plan_node
+        → execute_llm ↔ execution_tools → END
+```
+
+Each section serves a different purpose:
+- **Investigation loop** (entry, investigate_llm, investigation_tools): ReAct
+  with read-only tools, same pattern as Recon/DLQ
+- **Planning node** (plan_node): structured output via `.with_structured_output(BackfillPlan)`
+- **Approval gate** (approval_gate, revise_node): HITL interrupt/resume + rejection loop
+- **Execution loop** (execute_llm, execution_tools): ReAct with side-effect tools
+
+#### `interrupt()` — Pausing the Graph
+
+The approval gate node calls `interrupt(plan.model_dump())` which does three things:
+
+1. **Serializes the plan** and returns it to the caller as the interrupt value
+2. **Saves the full graph state** to the checkpointer (MemorySaver)
+3. **Pauses execution** — the graph stops, the `invoke()` call returns
+
+```python
+def approval_gate_node(state: dict) -> dict:
+    plan = state["plan"]
+    # This line PAUSES the graph and returns the plan to the caller
+    resume_value = interrupt(plan.model_dump())
+    # Everything below here runs ONLY when the graph is RESUMED
+    decision = resume_value.get("decision", "")
+    feedback = resume_value.get("feedback", "")
+    ...
+```
+
+The key insight: code AFTER `interrupt()` doesn't run immediately. It runs
+only when the caller resumes the graph with `Command(resume=...)`. The
+variable `resume_value` receives whatever the caller passes in the resume.
+
+#### `Command(resume=...)` — Resuming with a Decision
+
+The caller (your application code) resumes the interrupted graph by invoking
+it again with a `Command`:
+
+```python
+# To approve:
+graph.invoke(Command(resume={"decision": "approved"}),
+             config={"configurable": {"thread_id": "same-thread-id"}})
+
+# To reject with feedback:
+graph.invoke(Command(resume={"decision": "rejected",
+                              "feedback": "Add rollback steps for Gold layer"}),
+             config={"configurable": {"thread_id": "same-thread-id"}})
+```
+
+Two critical requirements:
+1. **Same `thread_id`** — the checkpointer uses this to find the saved state
+2. **The resume value structure** must match what the node expects
+
+#### Checkpointing — Why `MemorySaver` Is Required
+
+Without a checkpointer, `interrupt()` cannot save state. The graph would
+pause but the state would be lost — there would be nothing to resume from.
+
+```python
+# In build_backfill_graph():
+compiled = graph.compile(checkpointer=MemorySaver())
+```
+
+`MemorySaver` stores checkpoints in a Python dict (in-memory). This means:
+- ✅ Works for development and testing
+- ❌ State is lost when the process restarts
+- For production: `SqliteSaver` or `PostgresSaver` persist across restarts
+
+The `thread_id` is the key that links multiple `invoke()` calls to the same
+graph execution:
+
+```python
+config = {"configurable": {"thread_id": "backfill-2026-09-28-abc123"}}
+# First invoke: runs investigation → planning → interrupt
+result = graph.invoke(initial_state, config=config)
+# Second invoke: resumes from interrupt → execution → END
+result = graph.invoke(Command(resume={"decision": "approved"}), config=config)
+```
+
+#### The Rejection Loop
+
+When the human rejects, the approval gate sets `approval_status = "rejected"`
+and stores the feedback in `revision_feedback`. The conditional edge routes
+to `revise_node`:
+
+```python
+def _route_after_approval(state: dict) -> str:
+    status = state.get("approval_status", "")
+    if status == "approved":
+        return "execute_llm"      # → execution phase
+    elif status == "rejected":
+        return "revise_node"      # → inject feedback, re-plan
+    return END                     # error case
+```
+
+The revise node injects the human's feedback as a HumanMessage and resets the
+iteration counter (giving the LLM fresh tool-call budget):
+
+```python
+def revise_node(state: dict) -> dict:
+    revision_messages = BACKFILL_REVISION_TEMPLATE.invoke({
+        "plan_iterations": state["plan_iterations"],
+        "max_plan_iterations": state["max_plan_iterations"],
+        "revision_feedback": state["revision_feedback"],
+    })
+    return {
+        "messages": revision_messages.to_messages(),
+        "iteration": 0,  # RESET — fresh budget for revision
+    }
+```
+
+Then it routes to `plan_node`, which produces a NEW `BackfillPlan` considering
+the feedback. The plan goes through the approval gate again — this is the loop:
+
+```
+plan_node → approval_gate → (rejected) → revise_node → plan_node → approval_gate → ...
+```
+
+The loop has a safety cap: `max_plan_iterations` (default 3). If the human
+rejects 3 times, the approval gate routes to END instead of revise_node.
+
+#### Two ToolNodes, Three LLM Configurations
+
+The Recon/DLQ graphs each had one ToolNode and one `.bind_tools()` call. The
+Backfill graph has two of each, plus a `.with_structured_output()`:
+
+```python
+# In build_backfill_graph():
+
+# Config 1: Investigation LLM — 5 read-only tools
+model_with_investigation_tools = llm.bind_tools(BACKFILL_INVESTIGATION_TOOLS)
+
+# Config 2: Planning LLM — structured output, no tools
+#   (created inside plan_node factory via llm.with_structured_output(BackfillPlan))
+
+# Config 3: Execution LLM — 3 side-effect tools
+model_with_execution_tools = llm.bind_tools(BACKFILL_EXECUTION_TOOLS)
+
+# Two separate ToolNodes
+investigation_tool_node = ToolNode(BACKFILL_INVESTIGATION_TOOLS)
+execution_tool_node = ToolNode(BACKFILL_EXECUTION_TOOLS)
+```
+
+This is the graph-level enforcement of two-registry tool separation. The
+investigation LLM literally cannot call `execute_backfill_step` because that
+tool isn't in its bound set. The safety comes from the TOPOLOGY, not just
+the prompt.
+
+#### Execution Phase — The Second ReAct Loop
+
+After approval, the execution LLM node runs a standard ReAct loop but with
+execution tools (lock, execute, release). One key difference from the
+investigation loop: the execution system prompt is injected only on the
+FIRST call (detected by an empty `execution_audit`):
+
+```python
+if not state.get("execution_audit"):
+    # First execution call — inject the execution system prompt
+    exec_system = SystemMessage(content=BACKFILL_EXECUTION_PROMPT)
+    messages_for_llm = [exec_system] + [m for m in state["messages"]
+                                         if not isinstance(m, SystemMessage)]
+else:
+    messages_for_llm = state["messages"]
+```
+
+This avoids repeatedly injecting the system prompt on every ReAct iteration
+during execution (which would waste tokens).
+
+#### Edge Wiring — The Complete Graph
+
+The `build_backfill_graph()` function wires all 8 nodes:
+
+```python
+# Phase 1: Investigation
+graph.set_entry_point("entry")
+graph.add_edge("entry", "investigate_llm")
+graph.add_conditional_edges("investigate_llm", _should_continue_investigating,
+    {"investigation_tools": "investigation_tools", "plan_node": "plan_node"})
+graph.add_edge("investigation_tools", "investigate_llm")
+
+# Phase 2: Planning → Approval
+graph.add_edge("plan_node", "approval_gate")
+graph.add_conditional_edges("approval_gate", _route_after_approval,
+    {"execute_llm": "execute_llm", "revise_node": "revise_node", END: END})
+graph.add_edge("revise_node", "plan_node")
+
+# Phase 3: Execution
+graph.add_conditional_edges("execute_llm", _should_continue_executing,
+    {"execution_tools": "execution_tools", END: END})
+graph.add_edge("execution_tools", "execute_llm")
+```
+
+Three conditional edges (Recon/DLQ had one each) reflect the three decision
+points: "done investigating?", "approved/rejected?", "done executing?".
+
+#### Comparing Graph Builders
+
+| Aspect | Recon/DLQ | Backfill |
+|---|---|---|
+| Nodes | 4 | 8 |
+| ToolNodes | 1 | 2 |
+| LLM configs | 2 (tools + structured output) | 3 (investigation + planning + execution) |
+| Conditional edges | 1 (`_should_continue`) | 3 (investigate, approve, execute) |
+| Checkpointer | None | `MemorySaver()` |
+| Compilation | `graph.compile()` | `graph.compile(checkpointer=MemorySaver())` |
+| HITL | No | `interrupt()` + `Command(resume=...)` |
+| New imports | — | `from langgraph.types import Command, interrupt` |
+| | | `from langgraph.checkpoint.memory import MemorySaver` |
+
+
+---
+
 ## Concept Index
 
 A quick lookup: which file teaches which concept.
@@ -1010,6 +1596,50 @@ A quick lookup: which file teaches which concept.
 | Dual data sources (Kafka DLQ + bad_files) | `tools/pipeline/dlq_tools.py` | 3 |
 | ReAct topology reuse | `agents/dlq_triage/graph.py` | 3 |
 | Requeue safety validation | `experiments/dlq_live_test.py` | 3 |
+| Two-registry tool separation | `tools/pipeline/backfill_tools.py` | 4 |
+| Pipeline locking (exclusive locks) | `tools/pipeline/backfill_tools.py` | 4 |
+| Lock → Execute → Release pattern | `tools/pipeline/backfill_tools.py` | 4 |
+| Per-step execution audit trail | `tools/pipeline/backfill_tools.py` | 4 |
+| Step limit safety (`_MAX_STEPS_PER_INVOCATION`) | `tools/pipeline/backfill_tools.py` | 4 |
+| Idempotent lock acquisition | `tools/pipeline/backfill_tools.py` | 4 |
+| Timeout-based auto-release | `tools/pipeline/backfill_tools.py` | 4 |
+| Two-level iteration control | `agents/backfill/state.py` | 4 |
+| Plan as intermediate output | `agents/backfill/state.py` | 4 |
+| HITL approval state fields | `agents/backfill/state.py` | 4 |
+| Execution audit accumulator | `agents/backfill/state.py` | 4 |
+| Multi-phase prompting | `agents/backfill/prompts.py` | 4 |
+| Structured output rubric | `agents/backfill/prompts.py` | 4 |
+| Revision prompt with feedback injection | `agents/backfill/prompts.py` | 4 |
+| Multiple ChatPromptTemplates per agent | `agents/backfill/prompts.py` | 4 |
+| `interrupt()` (HITL pause) | `agents/backfill/graph.py` | 4 |
+| `Command(resume=...)` (HITL resume) | `agents/backfill/graph.py` | 4 |
+| Checkpointing (`MemorySaver`) | `agents/backfill/graph.py` | 4 |
+| `thread_id` for checkpoint identity | `agents/backfill/graph.py` | 4 |
+| Multiple `ToolNode`s in one graph | `agents/backfill/graph.py` | 4 |
+| Multiple LLM configs in one graph | `agents/backfill/graph.py` | 4 |
+| Multi-phase graph topology (8 nodes) | `agents/backfill/graph.py` | 4 |
+| Approval gate (conditional routing) | `agents/backfill/graph.py` | 4 |
+| Rejection loop (revise → re-plan) | `agents/backfill/graph.py` | 4 |
+| System prompt swapping between phases | `agents/backfill/graph.py` | 4 |
+| Plan summary as AIMessage | `agents/backfill/graph.py` | 4 |
+| Iteration counter reset on rejection | `agents/backfill/graph.py` | 4 |
+| Two-phase invoke lifecycle | `agents/backfill/agent.py` | 4 |
+| `_process_graph_result()` interrupt detection | `agents/backfill/agent.py` | 4 |
+| `has_pending_approval` property | `agents/backfill/agent.py` | 4 |
+| `_clear_phase_state()` lifecycle cleanup | `agents/backfill/agent.py` | 4 |
+| Thread ID from correlation_id | `agents/backfill/agent.py` | 4 |
+| Mocking interrupt detection (`get_state().next`) | `tests/agents/test_backfill_agent.py` | 4 |
+| Two-phase test pattern (invoke + resume mocks) | `tests/agents/test_backfill_agent.py` | 4 |
+| Rejection loop testing (multi-resume cycle) | `tests/agents/test_backfill_agent.py` | 4 |
+| Guard rail testing (ValueError on bad state) | `tests/agents/test_backfill_agent.py` | 4 |
+| `Command(resume=...)` verification in tests | `tests/agents/test_backfill_agent.py` | 4 |
+| Phase state lifecycle testing | `tests/agents/test_backfill_agent.py` | 4 |
+| Lazy graph building test | `tests/agents/test_backfill_agent.py` | 4 |
+| Live two-phase lifecycle testing | `experiments/backfill_live_test.py` | 4 |
+| Plan quality validation (structure checks) | `experiments/backfill_live_test.py` | 4 |
+| Live rejection feedback (compare v1 vs v2) | `experiments/backfill_live_test.py` | 4 |
+| Preflight dependency check | `experiments/backfill_live_test.py` | 4 |
+| Execution audit display | `experiments/backfill_live_test.py` | 4 |
 <!-- More rows will be added as new files are written -->
 
 ---
@@ -1150,5 +1780,166 @@ for the wrong category), idempotency guards (don't do it twice), rate limits
 The DLQ agent cross-references this to confirm SCHEMA_MISMATCH classifications
 — a "pending_consumer_update" status in the changelog is strong evidence that
 DLQ records with SchemaRegistryException are schema mismatches, not transient.
+
+**Plan-then-Execute** — A workflow pattern where the agent first investigates
+and produces a structured plan, then pauses for human approval before executing
+the plan. Unlike ReAct (which loops freely between reasoning and acting),
+Plan-then-Execute has a hard boundary between planning and execution. The
+Backfill agent uses this because backfill execution has irreversible side
+effects that require human sign-off.
+
+**Human-in-the-Loop (HITL)** — A design pattern where an automated workflow
+pauses at a designated point and waits for a human to make a decision before
+continuing. In LangGraph, this is implemented with `interrupt()` (pauses the
+graph) and `Command(resume=...)` (resumes with the human's decision). The graph
+state is preserved across the pause via checkpointing.
+
+**LangGraph Checkpointing** — The mechanism that saves graph state to persistent
+storage so it survives across interrupt/resume cycles. `MemorySaver` stores
+state in memory (dev/testing). `SqliteSaver` stores state in SQLite (production).
+Without checkpointing, `interrupt()` would lose all state when the graph pauses.
+
+**Pipeline Lock** — An exclusive lock that prevents concurrent writes to the
+same pipeline entity during backfill. In Argus, `acquire_pipeline_lock` creates
+a lock with ownership tracking and a 60-minute timeout. The lock prevents two
+backfill operations from running on the same entity simultaneously, which would
+corrupt data.
+
+**Two-Registry Tool Separation** — A pattern where an agent's tools are split
+into separate registries bound at different phases of the graph. Investigation
+tools (read-only) are bound during the planning phase; execution tools (side
+effects) are bound during the execution phase. This provides structural safety
+beyond prompt-level guardrails — the LLM literally cannot call execution tools
+during investigation because they aren't in its tool set.
+
+**Rejection Loop** — In the HITL pattern, the ability for the human reviewer
+to not just approve or reject, but to reject *with feedback*. The agent receives
+the feedback, reworks its plan, and re-presents it for approval. This creates a
+loop: plan → present → reject(feedback) → rework → present → approve → execute.
+
+**`Command(resume=...)`** — LangGraph's mechanism for resuming an interrupted
+graph with data from outside the graph (e.g., a human's approval decision).
+When the graph calls `interrupt()`, it pauses. When the caller invokes the graph
+again with `Command(resume={"approved": True})`, the interrupted node receives
+the resume value and continues execution.
+
+**Two-Level Iteration Control** — A safety pattern for agents with nested
+loops. The inner loop caps how many tool calls the LLM can make in one
+investigation round (`iteration` / `max_iterations`). The outer loop caps
+how many times the plan can be rejected and reworked (`plan_iterations` /
+`max_plan_iterations`). Each loop has its own counter and safety cap, and
+the inner loop resets when the outer loop cycles — the LLM gets fresh
+investigation budget for each rework attempt.
+
+**Multi-Phase Prompting** — Using separate system prompts for each phase of
+an agent's graph instead of one monolithic prompt. Each prompt focuses on
+the LLM's role in that phase: investigation strategy, structured output
+rubric, or execution safety rules. Prevents instruction leakage (the LLM
+seeing execution rules during investigation) and reduces per-call token cost.
+
+**Structured Output Rubric** — A prompt engineering technique that defines
+quality criteria for each field of a structured output (like BackfillPlan).
+For each field, the rubric provides good and bad examples so the LLM knows
+what level of detail and specificity is expected. Similar to confidence
+calibration but applied to plan quality rather than classification scores.
+
+**Revision Prompt** — A template injected when a human rejects the agent's
+plan. It frames the rejection explicitly, includes the human's feedback,
+shows the iteration count for urgency ("attempt 2 of 3"), and instructs
+the LLM to focus on what changed rather than starting over. Without the
+revision prompt, the LLM would either reproduce the same plan or waste
+iterations re-investigating from scratch.
+
+**Plan as Intermediate Output** — A design pattern where the agent produces
+its primary output (e.g., BackfillPlan) in the MIDDLE of the graph, not at
+the end. The plan sits in state between the investigation and execution
+phases, where the human reviews it. This contrasts with Recon and DLQ agents
+where the report is the final step.
+
+**Approval Flow State** — The set of state fields that drive the HITL
+approval gate: `approval_status` (the routing signal: pending/approved/
+rejected), `revision_feedback` (the human's rejection reason, injected as a
+HumanMessage), and `plan_iterations` / `max_plan_iterations` (the outer
+loop safety cap). These fields have no equivalent in autonomous agents.
+
+**`interrupt()`** — LangGraph's function that pauses graph execution at a
+node. The argument to `interrupt(value)` is returned to the caller (e.g.,
+the plan for human review). The graph state is saved to the checkpointer,
+and execution stops until the caller resumes with `Command(resume=...)`.
+Code after the `interrupt()` call runs only upon resume.
+
+**`Command(resume=...)`** — LangGraph's mechanism for resuming an interrupted
+graph with external data. The caller passes
+`graph.invoke(Command(resume={"decision": "approved"}), config=...)` and
+the resume value is delivered to the node that called `interrupt()`. The
+`config` must include the same `thread_id` so the checkpointer can find
+the saved state.
+
+**`MemorySaver`** — LangGraph's in-memory checkpointer for development and
+testing. It stores graph checkpoints (state snapshots) in a Python dict.
+Required for `interrupt()` to work — without a checkpointer, the graph
+cannot save or restore state across pauses. Production alternatives include
+`SqliteSaver` and `PostgresSaver`.
+
+**`thread_id`** — The key that identifies a specific graph execution for
+checkpointing. Passed in `config={"configurable": {"thread_id": "..."}}`.
+The initial `invoke()` and the resuming `invoke()` must use the same
+`thread_id` so the checkpointer links them to the same execution. Think
+of it like a session ID for the graph.
+
+**Approval Gate** — A graph node that pauses execution for human review
+using `interrupt()`. It receives the human's decision via `Command(resume=...)`
+and updates state fields (`approval_status`, `revision_feedback`) that drive
+conditional routing to execution (approved), revision (rejected), or
+termination (max revisions exceeded).
+
+**System Prompt Swapping** — Replacing the system prompt between graph phases
+so the LLM receives phase-appropriate instructions. The plan node filters out
+`SystemMessage`s from the conversation history and prepends
+`BACKFILL_PLANNING_PROMPT` instead of `BACKFILL_INVESTIGATION_PROMPT`. The
+non-system messages (evidence from investigation) are preserved.
+
+**Mocking Interrupt Detection** — The key test technique for the Backfill
+agent. The real graph uses `graph.get_state(config).next` to detect whether
+execution is paused at an interrupt (non-empty tuple like `("approval_gate",)`)
+or completed (empty tuple `()`). In tests, you mock this by creating a
+`MagicMock` with a `.next` attribute set to the desired value, then assigning
+it as `mock_graph.get_state.return_value`. This avoids needing a real
+checkpointer or graph compilation in unit tests.
+
+**Two-Phase Test Pattern** — A testing approach for agents with invoke/resume
+lifecycles. Unlike single-invoke agents where you set up one mock and call
+once, two-phase tests configure the mock graph twice in the same test: first
+for invoke (returning interrupted state), then reconfigure it for resume
+(returning completed state). The mock's `invoke.return_value` and
+`get_state().next` change between phases to simulate the graph's different
+behaviors.
+
+**Guard Rail Testing** — Tests that verify an agent rejects invalid usage
+patterns with clear errors. For the Backfill agent, calling `resume()` without
+a prior `invoke()` must raise `ValueError("No pending approval")`, because
+there's no `_thread_id` or `_context` to resume from. Guard rails prevent
+subtle bugs where the agent silently does the wrong thing instead of failing
+fast.
+
+**Plan Quality Validation** — Going beyond status-code checks (`result.status
+== "needs_approval"`) to validate the structure and content of the plan itself.
+Checks include: does it have an incident_summary, are proposed_steps ordered
+correctly (step.order matches position), does it have a risk_assessment, and
+is the estimated_duration non-empty. Catches cases where the LLM produces a
+technically valid Pydantic model but with empty or nonsensical content.
+
+**Preflight Check** — A dependency verification step at the start of a live
+test that confirms required files exist before attempting to import them.
+For `backfill_live_test.py`, this means checking that `graph.py` exists
+before trying to build the agent, since missing graph.py would produce a
+confusing ImportError deep in the call stack rather than a clear "build
+this file first" message.
+
+**Execution Audit Display** — A pretty-printing function in live tests that
+renders the `execution_audit` trail from the Backfill agent's result. Each
+entry is shown with a color-coded icon: 🔒 for lock acquisition, ⚙️ for
+step execution, and 🔓 for lock release. This helps verify that the
+Lock → Execute → Release pattern was followed correctly in real execution.
 
 <!-- More terms will be added as new concepts are introduced -->
