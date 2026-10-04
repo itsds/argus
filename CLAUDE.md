@@ -35,19 +35,28 @@ D:\repos\argus/
 │   │   │   ├── prompts.py     # Classification rubric + requeue safety rules
 │   │   │   ├── graph.py       # LangGraph StateGraph (same ReAct topology)
 │   │   │   └── agent.py       # BaseAgent subclass (DLQ adapter)
-│   │   └── backfill/
-│   │       ├── __init__.py    # Package marker (exists)
-│   │       ├── state.py       # BackfillState with HITL approval fields
-│   │       ├── prompts.py     # Multi-phase prompts (investigation, planning, execution)
-│   │       ├── graph.py       # Plan-then-Execute + HITL topology (TODO)
-│   │       └── agent.py       # BaseAgent subclass, two-phase invoke (TODO)
+│   │   ├── backfill/
+│   │   │   ├── __init__.py    # Package marker (exists)
+│   │   │   ├── state.py       # BackfillState with HITL approval fields
+│   │   │   ├── prompts.py     # Multi-phase prompts (investigation, planning, execution)
+│   │   │   ├── graph.py       # Plan-then-Execute + HITL topology (TODO)
+│   │   │   └── agent.py       # BaseAgent subclass, two-phase invoke (TODO)
+│   │   └── spark_debugger/
+│   │       ├── __init__.py    # Package marker
+│   │       ├── state.py       # SparkDebuggerState with hypothesis + reflection fields
+│   │       ├── prompts.py     # Investigation + reflection prompts, causal chain reasoning
+│   │       ├── graph.py       # ReAct + Reflection topology (5 nodes, 2 conditional edges)
+│   │       └── agent.py       # BaseAgent subclass with reflection metadata
 │   ├── schemas/
 │   │   └── reports.py         # Pydantic report models (all agents)
 │   ├── tools/
-│   │   └── pipeline/
-│   │       ├── recon_tools.py    # 6 @tool functions for Recon agent
-│   │       ├── dlq_tools.py     # 3 @tool functions for DLQ agent (includes side effects)
-│   │       └── backfill_tools.py # 8 @tool functions for Backfill agent (2 registries)
+│   │   ├── pipeline/
+│   │   │   ├── recon_tools.py    # 6 @tool functions for Recon agent
+│   │   │   ├── dlq_tools.py     # 3 @tool functions for DLQ agent (includes side effects)
+│   │   │   └── backfill_tools.py # 8 @tool functions for Backfill agent (2 registries)
+│   │   └── compute/
+│   │       ├── __init__.py      # Package marker
+│   │       └── spark_tools.py   # 6 @tool functions for Spark Debugger (SparkUI + event logs)
 │   └── cli/
 │       └── main.py            # Click CLI entry point
 ├── docs/
@@ -58,15 +67,18 @@ D:\repos\argus/
 │       ├── agent-and-schema-layer/
 │       ├── phase2-reconciliation/
 │       ├── phase3-dlq-triage/
-│       └── phase4-backfill/
+│       ├── phase4-backfill/
+│       └── phase5-spark-debugger/
 ├── tests/
 │   └── agents/
 │       ├── test_recon_agent.py  # Recon unit tests (mocked LLM, 7 test classes)
-│       └── test_dlq_agent.py   # DLQ unit tests (mocked LLM, 7 test classes)
+│       ├── test_dlq_agent.py   # DLQ unit tests (mocked LLM, 7 test classes)
+│       └── test_spark_debugger_agent.py  # Spark Debugger unit tests (8 test classes, FakeLLM)
 ├── experiments/
 │   ├── calculator_agent.py    # Phase 0 — ReAct learning agent
 │   ├── recon_live_test.py     # Phase 2 — Live integration test (real LLM)
-│   └── dlq_live_test.py       # Phase 3 — Live integration test (real LLM)
+│   ├── dlq_live_test.py       # Phase 3 — Live integration test (real LLM)
+│   └── spark_debugger_live_test.py  # Phase 5 — Live integration test (2 scenarios: skew + GC)
 └── .venv/
 ```
 
@@ -124,7 +136,14 @@ D:\repos\argus/
   - ✅ `agents/backfill/agent.py` — BaseAgent subclass with two-phase invoke (invoke → needs_approval → resume, thread_id management, interrupt detection via graph_state.next, Command(resume=...))
   - ⬜ `tests/agents/test_backfill_agent.py` — Unit tests including interrupt/resume/rejection flows
   - ⬜ `experiments/backfill_live_test.py` — Live integration test with real LLM
-- **Phase 5**: Spark Debugger agent (most complex)
+- **Phase 5** (COMPLETE): AI Spark Debugger agent (ReAct + Reflection)
+  - ✅ `tools/compute/spark_tools.py` — 6 compute-aware tools with simulated data (2 scenarios: data skew + GC pressure)
+  - ✅ `agents/spark_debugger/state.py` — SparkDebuggerState with hypothesis, reflection_count, two-level iteration
+  - ✅ `agents/spark_debugger/prompts.py` — Investigation + reflection prompts, causal chain reasoning, bottleneck categories
+  - ✅ `agents/spark_debugger/graph.py` — ReAct + Reflection topology (5 nodes, 2 conditional edges, string-based routing)
+  - ✅ `agents/spark_debugger/agent.py` — BaseAgent subclass with reflection metadata in results
+  - ✅ `tests/agents/test_spark_debugger_agent.py` — Unit tests (8 test classes, FakeLLM, reflection loop testing)
+  - ✅ `experiments/spark_debugger_live_test.py` — Live integration test (2 scenarios, 10 validation checks each)
 - **Phase 6**: Integration, testing, observability
 
 ## Key Patterns
@@ -134,6 +153,19 @@ D:\repos\argus/
 - **ReAct + Reflection** — Spark Debugger (hypothesis → evidence → refine)
 - **Classification + Confidence Scoring** — DLQ Triage
 - **Human-in-the-Loop** — LangGraph interrupt() for Backfill approval gates
+
+## Phase 5 New Concepts (vs Phase 4)
+
+- **ReAct + Reflection pattern** — after ReAct investigation loop, a reflect node evaluates hypothesis completeness before proceeding to report
+- **Hypothesis as first-class state** — `hypothesis` field tracked across iterations, refined through reflection, audited in final results
+- **Two-level iteration (reflection variant)** — inner loop (tool calls: `iteration`/`max_iterations=15`) + outer loop (reflections: `reflection_count`/`max_reflections=2`)
+- **Reflect node with plain model** — LLM call without tools bound, forcing reasoning over action (can't investigate, must evaluate)
+- **String-based routing for reflection** — `NEEDS_MORE_INVESTIGATION` / `HYPOTHESIS_CONFIRMED` keyword matching instead of structured output to preserve critique quality
+- **Causal chain reasoning** — prompt engineering technique teaching agent to trace symptom → intermediate effect → root cause (not just list symptoms)
+- **Compute-aware vs pipeline-aware tools** — completely different tool set from other agents (SparkUI REST API, event logs, physical plans vs watermarks, row counts, DLQ)
+- **Spark execution hierarchy** — Application → Jobs → Stages → Tasks, tools organized around this hierarchy
+- **Reflection metadata in results** — `_meta` dict (iterations, reflections, hypothesis) added to AgentResult for audit trail visibility
+- **Three model configurations** — `model_with_tools` (investigation), plain `model` (reflection), `model.with_structured_output()` (report) in one graph
 
 ## Phase 4 New Concepts (vs Phase 3)
 
@@ -175,6 +207,7 @@ D:\repos\argus/
 - Run calculator agent: `python experiments/calculator_agent.py`
 - Run Recon live test: `python experiments/recon_live_test.py`
 - Run DLQ live test: `python experiments/dlq_live_test.py`
+- Run Spark Debugger live test: `python experiments/spark_debugger_live_test.py --scenario 1` (or `--scenario 2` for GC pressure)
 
 ## Conventions
 

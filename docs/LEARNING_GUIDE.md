@@ -23,6 +23,7 @@ implementation; this guide focuses on the *architecture-level why*.
 - [Phase 2: Reconciliation Diagnostics Agent](#phase-2-reconciliation-diagnostics-agent)
 - [Phase 3: DLQ Triage & Auto-Remediation Agent](#phase-3-dlq-triage--auto-remediation-agent)
 - [Phase 4: Incident & Backfill Planning Agent](#phase-4-incident--backfill-planning-agent)
+- [Phase 5: AI Spark Debugger Agent](#phase-5-ai-spark-debugger-agent)
 - [Concept Index](#concept-index)
 - [Glossary](#glossary)
 
@@ -1546,6 +1547,276 @@ points: "done investigating?", "approved/rejected?", "done executing?".
 
 ---
 
+## Phase 5: AI Spark Debugger Agent
+
+> **Goal:** Build the most complex agent — a Spark performance debugger that
+> uses the ReAct + Reflection pattern to investigate bottlenecks, self-critique
+> its hypothesis, and produce a diagnosis with causal chain reasoning.
+
+### What makes this agent different?
+
+The Spark Debugger is unique in Argus in three ways:
+
+1. **Compute-aware, not pipeline-aware** — completely different tools from
+   agents 1–3. No watermarks, gate results, or DLQ records. Instead: SparkUI
+   REST API, event logs, physical execution plans.
+
+2. **ReAct + Reflection** — adds a self-critique loop on top of ReAct. After
+   investigating, the agent evaluates its own hypothesis before producing a
+   report. If gaps are found, it goes back and investigates more.
+
+3. **Two-level iteration** — inner loop (tool calls, max 15) + outer loop
+   (reflections, max 2). Each level has its own safety valve.
+
+### Reading order and concept map:
+
+```
+tools/compute/spark_tools.py ──── Spark-specific investigation tools
+    │
+    ▼
+agents/spark_debugger/state.py ── Hypothesis + reflection tracking
+    │
+    ▼
+agents/spark_debugger/prompts.py ── Investigation + reflection prompts
+    │
+    ▼
+agents/spark_debugger/graph.py ── ReAct + Reflection topology (5 nodes)
+    │
+    ▼
+agents/spark_debugger/agent.py ── BaseAgent adapter with reflection metadata
+    │
+    ▼
+tests/agents/test_spark_debugger_agent.py ── FakeLLM, reflection loop tests
+    │
+    ▼
+experiments/spark_debugger_live_test.py ── 2 scenarios, 10 checks each
+```
+
+### `tools/compute/spark_tools.py` — Compute-Aware Tools
+
+**Concepts taught:** Compute-aware vs pipeline-aware tools, Spark execution hierarchy, simulated Spark data
+
+Unlike the pipeline tools (Recon, DLQ, Backfill) that query Iceberg tables,
+Kafka topics, and Airflow metadata, the Spark tools query the Spark execution
+infrastructure:
+
+| Tool | What it queries | Spark concept |
+|------|----------------|---------------|
+| `get_application_info` | SparkUI REST `/applications/{app_id}` | Application metadata |
+| `get_stage_metrics` | SparkUI REST `/applications/{app_id}/stages` | Stage-level durations and sizes |
+| `get_task_distribution` | SparkUI REST `/stages/{stage_id}/taskSummary` | Per-task skew analysis |
+| `get_executor_metrics` | SparkUI REST `/allexecutors` | Memory, GC, disk usage |
+| `parse_physical_plan` | Spark event log SQL section | Physical plan operators |
+| `read_event_log` | HDFS/S3 event log file | Raw Spark events |
+
+**Key insight — Spark execution hierarchy:**
+```
+Application (one Spark submit)
+  └── Jobs (triggered by actions like .write())
+      └── Stages (separated by shuffles)
+          └── Tasks (one per partition, run on executors)
+```
+
+Tools are organized around this hierarchy. The agent starts at the top
+(application overview), finds the bottleneck stage, then drills into task
+distribution and executor health.
+
+**Two simulated scenarios:**
+
+| Scenario | App ID | Bottleneck | Root cause |
+|----------|--------|-----------|------------|
+| Data Skew | `app-20260928-001` | Stage 2 SortMergeJoin | booking_id "BK-PREMIUM-001" hot key, 890MB vs 6.8MB median |
+| GC Pressure | `app-20260927-001` | All stages | 2g executor memory, AQE disabled, 95%+ memory utilization |
+
+These exercise different debugging paths: localized skew (one stage, one key)
+vs systemic pressure (all executors, config-level fix needed).
+
+### `agents/spark_debugger/state.py` — Hypothesis as First-Class State
+
+**Concepts taught:** Hypothesis tracking, two-level iteration (reflection variant)
+
+The key difference from Recon/DLQ state: the **hypothesis** field.
+
+```python
+hypothesis: str           # Updated after each reflection
+reflection_count: int     # How many times we've reflected (outer loop)
+max_reflections: int      # Safety cap for outer loop (default: 2)
+iteration: int            # How many tool calls (inner loop)
+max_iterations: int       # Safety cap for inner loop (default: 15)
+```
+
+**Why max_iterations=15 (vs 10 for Recon)?** Spark debugging typically needs
+7–9 tool calls for a full investigation, plus the agent may need to re-investigate
+after reflection finds gaps. 15 gives enough budget for one full round plus
+a focused follow-up.
+
+**Why max_reflections=2?** Most diagnoses converge after 1 reflection. A second
+reflection catches edge cases. Beyond 2, the agent is unlikely to find new evidence
+— it's just churning.
+
+**What's NOT here:** No `plan`, `approval_status`, or `revision_feedback` fields.
+This agent is fully autonomous — no human-in-the-loop.
+
+### `agents/spark_debugger/prompts.py` — Two Prompts, Not One
+
+**Concepts taught:** Investigation vs reflection prompting, causal chain reasoning, bottleneck categories
+
+This is the first agent with a **reflection prompt** — a separate prompt designed
+for self-critique rather than investigation.
+
+| Prompt | Used by | Tools? | Purpose |
+|--------|---------|--------|---------|
+| `SPARK_DEBUGGER_SYSTEM_PROMPT` | entry + llm nodes | Yes | Define expertise, investigation strategy |
+| `SPARK_REFLECTION_PROMPT` | reflect node | No | Self-critique, gap detection |
+
+**Causal chain reasoning** is the core prompt engineering technique:
+
+```
+❌ Symptom-level: "GC is high"
+✅ Causal chain: "Skew → one partition gets 130x data → spill → GC pressure"
+```
+
+The investigation prompt teaches this through explicit ❌/✅ examples.
+The reflection prompt reinforces it with Question 3: "Have you traced the
+chain from root cause → intermediate effects → observed symptoms?"
+
+**Bottleneck categories** align directly with `SparkBottleneck.category`:
+- `skew` — data skew across partitions
+- `spill` — memory spill to disk
+- `small_files` — too many small input files
+- `broadcast` — missed broadcast join opportunity
+- `gc_pressure` — excessive garbage collection
+
+This alignment ensures the LLM's free-form investigation produces output
+that fits the structured Pydantic report.
+
+### `agents/spark_debugger/graph.py` — ReAct + Reflection Topology
+
+**Concepts taught:** Reflect node design, two conditional edges, string-based routing, three model configurations
+
+This is the most complex graph in Argus — 5 nodes and 2 conditional edges:
+
+```
+entry → llm → should_continue? → tools → llm (inner loop)
+                    ↓
+                 reflect → should_revise? → llm (outer loop)
+                                ↓
+                              report → END
+```
+
+Compare with Recon (4 nodes, 1 conditional edge):
+```
+entry → llm → should_continue? → tools → llm (loop)
+                    ↓
+                  report → END
+```
+
+**The reflect node** is a separate LLM call WITHOUT tools bound. This forces
+the LLM to reason about its hypothesis instead of trying to investigate more.
+It extracts the hypothesis from the last AIMessage, renders
+`SPARK_REFLECTION_PROMPT`, and calls the plain model.
+
+**String-based routing in `should_revise`:**
+```python
+if "NEEDS_MORE_INVESTIGATION" in content.upper():
+    return "llm"  # Back to investigation
+return "report"   # Default: proceed to report
+```
+
+This is intentionally loose — forcing JSON for reflection would reduce critique
+quality. The default-to-report behavior prevents infinite loops when the LLM's
+reflection format is unexpected.
+
+**Three model configurations:**
+1. `model_with_tools` → llm_node (investigation with tools)
+2. `llm` (plain) → reflect_node (self-critique, no tools)
+3. `llm.with_structured_output(SparkDiagnosis)` → report_node (final output)
+
+### `agents/spark_debugger/agent.py` — Same Pattern, Reflection Metadata
+
+**Concepts taught:** BaseAgent adapter consistency, reflection audit trail
+
+Structurally identical to ReconciliationAgent, with differences in the data:
+
+| Aspect | Recon | Spark Debugger |
+|--------|-------|----------------|
+| TriggerContext param | `gate_failure` | `app_id` |
+| Config keys | `agents.reconciliation.*` | `agents.spark_debugger.*` |
+| Report type | `ReconReport` | `SparkDiagnosis` |
+| Extra metadata | None | `_meta` (iterations, reflections, hypothesis) |
+
+The `_meta` dict is unique to this agent — it gives audit trail visibility
+into how the reflection process worked:
+
+```python
+report_dict["_meta"] = {
+    "iterations": final_state.get("iteration", 0),
+    "reflections": final_state.get("reflection_count", 0),
+    "hypothesis": final_state.get("hypothesis", ""),
+}
+```
+
+### `tests/agents/test_spark_debugger_agent.py` — FakeLLM Pattern
+
+**Concepts taught:** FakeLLM for deterministic testing, reflection loop testing
+
+Instead of `MagicMock`, this test file introduces `FakeLLM` — a class that
+returns predetermined responses in sequence:
+
+```python
+class FakeLLM:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self._call_count = 0
+
+    def invoke(self, messages, **kwargs):
+        response = self._responses[self._call_count]
+        self._call_count += 1
+        return response
+```
+
+**Why FakeLLM instead of MagicMock?** The reflection loop needs the LLM to
+return different responses at different stages (tool calls, then reflection
+keywords, then a diagnosis). FakeLLM makes the sequence explicit and testable.
+
+Key test patterns:
+- **Reflection loop test** — FakeLLM returns `NEEDS_MORE_INVESTIGATION`,
+  verifies the graph routes back to investigation
+- **Safety valve test** — max_iterations forces transition to reflect
+- **Agent invoke test** — full TriggerContext → AgentResult lifecycle
+
+### `experiments/spark_debugger_live_test.py` — Two-Scenario Validation
+
+**Concepts taught:** Live testing with real LLM, scenario-based validation
+
+Two scenarios with 10 validation checks each:
+
+1. **Data Skew** (`app-20260928-001`) — expects `skew` bottleneck, mentions
+   of "booking" and "partition" in root cause
+2. **GC Pressure** (`app-20260927-001`) — expects `gc_pressure` bottleneck,
+   mentions of "memory" and "gc" in root cause
+
+Validation checks include: status, report existence, bottleneck category,
+root cause keywords, recommendation count, tool usage (≥3 tools called),
+reflection metadata presence, and severity assessment.
+
+### Phase 5 Architecture Comparison
+
+| Aspect | Recon (Phase 2) | DLQ (Phase 3) | Backfill (Phase 4) | Spark (Phase 5) |
+|--------|----------------|---------------|-------------------|-----------------|
+| Pattern | ReAct | ReAct | Plan-then-Execute + HITL | ReAct + Reflection |
+| Nodes | 4 | 4 | 8 | 5 |
+| Conditional edges | 1 | 1 | 3 | 2 |
+| Tool registries | 1 | 1 | 2 | 1 |
+| LLM configs | 2 | 2 | 3 | 3 |
+| Checkpointing | No | No | Yes (MemorySaver) | No |
+| HITL | No | No | Yes (interrupt) | No |
+| Reflection | No | No | No | Yes |
+| Tool domain | Pipeline | Pipeline | Pipeline | Compute |
+| Max iterations | 10 | 10 | 10 | 15 |
+
+---
+
 ## Concept Index
 
 A quick lookup: which file teaches which concept.
@@ -1640,6 +1911,28 @@ A quick lookup: which file teaches which concept.
 | Live rejection feedback (compare v1 vs v2) | `experiments/backfill_live_test.py` | 4 |
 | Preflight dependency check | `experiments/backfill_live_test.py` | 4 |
 | Execution audit display | `experiments/backfill_live_test.py` | 4 |
+| Compute-aware tools (vs pipeline-aware) | `tools/compute/spark_tools.py` | 5 |
+| Spark execution hierarchy (App→Job→Stage→Task) | `tools/compute/spark_tools.py` | 5 |
+| Simulated Spark data (two scenarios) | `tools/compute/spark_tools.py` | 5 |
+| Hypothesis as first-class state | `agents/spark_debugger/state.py` | 5 |
+| Two-level iteration (reflection variant) | `agents/spark_debugger/state.py` | 5 |
+| Causal chain reasoning | `agents/spark_debugger/prompts.py` | 5 |
+| Reflection prompt (self-critique) | `agents/spark_debugger/prompts.py` | 5 |
+| Investigation vs reflection prompt separation | `agents/spark_debugger/prompts.py` | 5 |
+| Bottleneck categories as schema guidance | `agents/spark_debugger/prompts.py` | 5 |
+| ReAct + Reflection topology (5 nodes) | `agents/spark_debugger/graph.py` | 5 |
+| Reflect node (plain model, no tools) | `agents/spark_debugger/graph.py` | 5 |
+| Two conditional edges (inner + outer) | `agents/spark_debugger/graph.py` | 5 |
+| String-based routing (keyword matching) | `agents/spark_debugger/graph.py` | 5 |
+| Three model configurations in one graph | `agents/spark_debugger/graph.py` | 5 |
+| Safety valves at both iteration levels | `agents/spark_debugger/graph.py` | 5 |
+| Reflection metadata in AgentResult | `agents/spark_debugger/agent.py` | 5 |
+| Config-driven iteration limits | `agents/spark_debugger/agent.py` | 5 |
+| FakeLLM (sequential response testing) | `tests/agents/test_spark_debugger_agent.py` | 5 |
+| Reflection loop testing | `tests/agents/test_spark_debugger_agent.py` | 5 |
+| Safety valve testing (max_iterations) | `tests/agents/test_spark_debugger_agent.py` | 5 |
+| Two-scenario live testing (skew + GC) | `experiments/spark_debugger_live_test.py` | 5 |
+| Reflection metadata validation | `experiments/spark_debugger_live_test.py` | 5 |
 <!-- More rows will be added as new files are written -->
 
 ---
@@ -1941,5 +2234,73 @@ renders the `execution_audit` trail from the Backfill agent's result. Each
 entry is shown with a color-coded icon: 🔒 for lock acquisition, ⚙️ for
 step execution, and 🔓 for lock release. This helps verify that the
 Lock → Execute → Release pattern was followed correctly in real execution.
+
+**ReAct + Reflection** — An extension of the ReAct pattern that adds a
+self-critique step. After the agent's investigation loop (tool calls) finishes,
+a reflect node evaluates whether the hypothesis is complete. If gaps are found,
+the agent is routed back to investigate more. If the hypothesis is solid, it
+proceeds to generate the final report. This creates a two-level loop: inner
+(tool calls) and outer (reflections).
+
+**Reflection Prompt** — A separate system prompt used exclusively by the
+reflect node, designed for self-critique rather than investigation. It asks
+specific questions about evidence sufficiency, alternative explanations, and
+causal chain completeness. Unlike the investigation prompt, the reflection
+prompt has no tools bound — the LLM is forced to reason, not act.
+
+**Hypothesis** — In the Spark Debugger, a first-class state field that
+tracks the agent's evolving understanding of the root cause. The hypothesis
+is extracted from the LLM's last message before reflection, evaluated by the
+reflect node, and potentially refined through re-investigation. It appears
+in the final result's `_meta` dict for audit purposes.
+
+**Causal Chain Reasoning** — A prompt engineering technique that teaches the
+LLM to trace symptoms back to root causes through intermediate effects,
+rather than just listing what it observes. Example: instead of "GC is high"
+(symptom-level), the agent should produce "Skew → one partition gets 130x
+data → memory spill → GC pressure" (causal chain).
+
+**String-Based Routing** — Using keyword matching on the LLM's natural
+language output to determine graph routing, instead of structured output
+(JSON). The reflect node's response is checked for "NEEDS_MORE_INVESTIGATION"
+or "HYPOTHESIS_CONFIRMED". This preserves the quality of the LLM's critique
+— forcing JSON for reflection would constrain the reasoning.
+
+**Compute-Aware Tools** — Tools that query Spark execution infrastructure
+(SparkUI REST API, event logs, physical plans) rather than data pipeline
+metadata (watermarks, row counts, DLQ records). The Spark Debugger's tools
+are entirely different from agents 1–3, organized around the Spark execution
+hierarchy: Application → Jobs → Stages → Tasks.
+
+**Spark Execution Hierarchy** — The nested structure of a Spark application's
+execution: an Application contains Jobs (triggered by actions like `.write()`),
+Jobs contain Stages (separated by shuffle boundaries), and Stages contain
+Tasks (one per partition, executed on Executors). Understanding this hierarchy
+is essential for Spark debugging — the agent starts at the Application level
+and drills down to find where time is spent.
+
+**Data Skew** — An uneven distribution of data across partitions in a Spark
+stage. When one partition has significantly more data than others (e.g.,
+890MB vs 6.8MB median), that partition's task takes much longer, becoming
+the bottleneck for the entire stage. Common cause: a "hot key" that appears
+disproportionately often in a join or group-by column.
+
+**GC Pressure** — Excessive garbage collection in a Spark executor's JVM,
+consuming CPU time that should be used for computation. Typically caused by
+insufficient executor memory, memory spill, or too many objects in the heap.
+In Argus's simulated data, the GC pressure scenario shows 27-28% GC overhead
+with 95%+ memory utilization and only 2g executor memory.
+
+**FakeLLM** — A test utility class that returns predetermined responses in
+sequence, unlike `MagicMock` which returns the same value every time. Used
+for testing the reflection loop where the LLM must return different responses
+at different stages (tool calls during investigation, keywords during
+reflection, structured output during report generation).
+
+**Reflection Metadata** — The `_meta` dict added to the Spark Debugger's
+AgentResult, containing `iterations` (total tool calls), `reflections`
+(how many hypothesis refinements), and `hypothesis` (the final hypothesis
+before report generation). Unique to the Spark Debugger — other agents don't
+have reflection audit trails.
 
 <!-- More terms will be added as new concepts are introduced -->
